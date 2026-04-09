@@ -25,9 +25,9 @@ from telegram.ext import (
 # ════════════════════════════════════════════════════════
 #  ⚙️  AYARLAR
 # ════════════════════════════════════════════════════════
-
-TELEGRAM_TOKEN = "BURAYA_BOT_TOKEN"
-CHAT_ID        = "BURAYA_CHAT_ID"
+import os
+TELEGRAM_TOKEN = os.environ.get("8597080702:AAFY-udbqWDoTmuAJIr52GGmDl5DuSCTFoE", "")
+CHAT_ID        = os.environ.get("1003976351142", "")
 CHECK_EVERY    = 1
 ALERT_COOLDOWN = 30
 DAILY_REPORT   = "09:00"
