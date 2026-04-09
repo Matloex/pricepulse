@@ -25,9 +25,9 @@ from telegram.ext import (
 # ════════════════════════════════════════════════════════
 #  ⚙️  AYARLAR
 # ════════════════════════════════════════════════════════
-import os
-TELEGRAM_TOKEN = os.environ.get("8597080702:AAFY-udbqWDoTmuAJIr52GGmDl5DuSCTFoE", "")
-CHAT_ID        = os.environ.get("1003976351142", "")
+
+TELEGRAM_TOKEN = "BURAYA_BOT_TOKEN"
+CHAT_ID        = "BURAYA_CHAT_ID"
 CHECK_EVERY    = 1
 ALERT_COOLDOWN = 30
 DAILY_REPORT   = "09:00"
@@ -1066,8 +1066,12 @@ async def callback_handler(update, context):
 
     if action == "delete":
         p = next((x for x in PRODUCTS if x["id"]==parts[1]),None)
-        if p: PRODUCTS.remove(p); save_products(PRODUCTS)
+        if p:
+            PRODUCTS.remove(p)
+            save_products(PRODUCTS)
             await query.edit_message_text(f"🗑 <b>{p.get('keyword') or p.get('seller_name') or p.get('name')}</b> silindi.", parse_mode="HTML")
+        else:
+            await query.edit_message_text("❌ Bulunamadı.")
         return
 
     if action == "history":
