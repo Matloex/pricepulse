@@ -33,7 +33,7 @@ from telegram.ext import (
 # ════════════════════════════════════════════════════════
 
 TELEGRAM_TOKEN = "8597080702:AAFY-udbqWDoTmuAJIr52GGmDl5DuSCTFoE"
-CHAT_ID = "1003976351142"
+CHAT_ID = "1919442353"
 CHECK_EVERY = 1
 ALERT_COOLDOWN = 30
 DAILY_REPORT = "09:00"
