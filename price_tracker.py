@@ -51,6 +51,7 @@ TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN",  "8597080702:AAFY-udbqWDoTmuA
 CHAT_ID         = int(os.environ.get("CHAT_ID", "1003976351142"))
 UPSTASH_URL     = os.environ.get("UPSTASH_URL",      "")
 UPSTASH_TOKEN   = os.environ.get("UPSTASH_TOKEN",    "")
+SCRAPER_KEY     = os.environ.get("SCRAPER_API_KEY",  "")  # scraperapi.com
 CHECK_EVERY     = 1
 ALERT_COOLDOWN  = 30
 DAILY_REPORT    = "09:00"
@@ -404,10 +405,7 @@ def _try_jsonld(soup) -> float | None:
     return None
 
 def _decode_response(r) -> str:
-    """Response'u doğru şekilde decode et — brotli/gzip/deflate hepsini handle eder."""
-    import codecs
-    # requests zaten Content-Encoding'i otomatik handle eder (gzip, deflate)
-    # Brotli için brotli kütüphanesi gerekir, yoksa manuel dene
+    """Response içeriğini güvenli şekilde string'e çevir."""
     try:
         return r.content.decode("utf-8")
     except UnicodeDecodeError:
@@ -416,146 +414,122 @@ def _decode_response(r) -> str:
         except:
             return r.text
 
-def get_price_trendyol(url: str):
-    try:
-        # Brotli'yi devre dışı bırak — Accept-Encoding'i sınırla
+def scraper_get(url: str, timeout: int = 20) -> requests.Response:
+    """
+    ScraperAPI üzerinden istek at.
+    SCRAPER_API_KEY varsa ScraperAPI kullan (bot korumasını aşar),
+    yoksa direkt istek at.
+    """
+    if SCRAPER_KEY:
+        api_url = "https://api.scraperapi.com/"
+        params = {
+            "api_key": SCRAPER_KEY,
+            "url": url,
+            "render": "false",   # JS render istemiyoruz, sadece HTML lazım
+            "country_code": "tr",
+        }
+        return SESSION.get(api_url, params=params, timeout=timeout)
+    else:
         headers = dict(SESSION.headers)
         headers["Accept-Encoding"] = "gzip, deflate"
-        r = SESSION.get(url, timeout=15, headers=headers)
-        log.info(f"  Trendyol HTTP {r.status_code} encoding={r.encoding} [{url[:55]}]")
+        return SESSION.get(url, headers=headers, timeout=timeout)
+
+def get_price_trendyol(url: str):
+    try:
+        r    = scraper_get(url)
+        html = _decode_response(r)
+        log.info(f"  Trendyol HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
-
-        html = _decode_response(r)
-        soup = BeautifulSoup(html, "html.parser")
+        soup     = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".sold-out-badge, .out-of-stock"))
-
-        # 1. Script içinde fiyat regex
-        for pattern in [
+        for pat in [
             r'"discountedPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"sellingPrice"\s*:\s*([\d]+(?:\.\d+)?)',
-            r'"price"\s*:\s*\{[^}]*"value"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"originalPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"price"\s*:\s*([\d]+(?:\.\d+)?)',
-            r'"amount"\s*:\s*([\d]+(?:\.\d+)?)',
         ]:
-            m = re.search(pattern, html)
+            m = re.search(pat, html)
             if m:
                 p = parse_price(m.group(1))
                 if p and 10 < p < 1_000_000:
-                    log.info(f"  Trendyol regex fiyat: {p}")
+                    log.info(f"  Trendyol fiyat: {p}")
                     return p, in_stock
-
-        # 2. JSON-LD
         p = _try_jsonld(soup)
-        if p:
-            log.info(f"  Trendyol JSON-LD fiyat: {p}")
-            return p, in_stock
-
-        # 3. CSS
-        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg", "[class*='prc-dsc']"]:
+        if p: return p, in_stock
+        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
                 if p and 10 < p < 1_000_000:
-                    log.info(f"  Trendyol CSS fiyat: {p}")
                     return p, in_stock
-
-        # 4. TL/₺ yanındaki sayı
-        matches = re.findall(r'([\d]{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*(?:TL|₺)', html)
-        for raw in matches:
+        for raw in re.findall(r'([\d]{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*(?:TL|₺)', html):
             p = parse_price(raw)
             if p and 10 < p < 1_000_000:
-                log.info(f"  Trendyol TL regex: {p}")
                 return p, in_stock
-
-        title = soup.title.string if soup.title else "yok"
-        log.warning(f"  Trendyol fiyat yok | başlık: {title[:60]}")
-        log.warning(f"  Trendyol HTML ilk 300: {html[:300]}")
+        log.warning(f"  Trendyol fiyat yok | {soup.title.string[:50] if soup.title else 'yok'}")
     except Exception as e:
-        log.warning(f"  Trendyol hata [{url[:50]}]: {e}")
+        log.warning(f"  Trendyol hata: {e}")
     return None, True
 
 
 def get_price_hepsiburada(url: str):
     try:
-        headers = dict(SESSION.headers)
-        headers["Accept-Encoding"] = "gzip, deflate"
-        r = SESSION.get(url, timeout=15, headers=headers)
+        r    = scraper_get(url)
+        html = _decode_response(r)
         log.info(f"  Hepsiburada HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
-
-        html = _decode_response(r)
-        soup = BeautifulSoup(html, "html.parser")
+        soup     = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".out-of-stock, .tezgah-out-of-stock"))
-
-        # 1. itemprop
         el = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
             if p and 10 < p < 1_000_000:
-                log.info(f"  Hepsiburada itemprop fiyat: {p}")
+                log.info(f"  Hepsiburada fiyat: {p}")
                 return p, in_stock
-
-        # 2. JSON-LD
         p = _try_jsonld(soup)
         if p and 10 < p < 1_000_000:
-            log.info(f"  Hepsiburada JSON-LD fiyat: {p}")
             return p, in_stock
-
-        # 3. Script regex
-        for pattern in [
+        for pat in [
             r'"salePrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
             r'"currentPrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
             r'"price"\s*:\s*([\d]+(?:[.,]\d+)?)',
             r'data-price="([\d]+(?:[.,]\d+)?)"',
         ]:
-            m = re.search(pattern, html)
+            m = re.search(pat, html)
             if m:
                 p = parse_price(m.group(1))
                 if p and 10 < p < 1_000_000:
-                    log.info(f"  Hepsiburada regex fiyat: {p}")
+                    log.info(f"  Hepsiburada fiyat: {p}")
                     return p, in_stock
-
-        # 4. CSS
         for sel in [".price-value", "[class*='currentPrice']", ".product-price"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
                 if p and 10 < p < 1_000_000:
-                    log.info(f"  Hepsiburada CSS fiyat: {p}")
                     return p, in_stock
-
-        log.warning(f"  Hepsiburada fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
+        log.warning(f"  Hepsiburada fiyat yok | {soup.title.string[:50] if soup.title else 'yok'}")
     except Exception as e:
-        log.warning(f"  Hepsiburada hata [{url[:50]}]: {e}")
+        log.warning(f"  Hepsiburada hata: {e}")
     return None, True
 
 
 def get_price_amazon(url: str):
     try:
-        url = normalize_amazon(url)
-        headers = dict(SESSION.headers)
-        headers["Accept-Encoding"] = "gzip, deflate"
-        r = SESSION.get(url, timeout=15, headers=headers)
+        url  = normalize_amazon(url)
+        r    = scraper_get(url)
+        html = _decode_response(r)
         log.info(f"  Amazon HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
-
-        html = _decode_response(r)
-        soup = BeautifulSoup(html, "html.parser")
-        in_stock = ("Stokta yok" not in html
-                    and "currently unavailable" not in html.lower()
-                    and "şu anda mevcut değil" not in html.lower())
-
+        soup     = BeautifulSoup(html, "html.parser")
+        in_stock = ("Stokta yok" not in html and "currently unavailable" not in html.lower())
         for sel in [
             "#corePriceDisplay_desktop_feature_div .a-price-whole",
             "#corePriceDisplay_desktop_feature_div .a-offscreen",
             ".a-price.aok-align-center .a-offscreen",
-            "#priceblock_ourprice", "#priceblock_dealprice",
-            "#apex_desktop_newAccordionRow .a-price-whole",
-            ".a-price-whole",
+            "#priceblock_ourprice", "#priceblock_dealprice", ".a-price-whole",
         ]:
             el = soup.select_one(sel)
             if el:
@@ -565,67 +539,41 @@ def get_price_amazon(url: str):
                     if frac:
                         try:
                             fv = parse_price(frac.get_text())
-                            if fv and fv < 100:
-                                p += fv / 100
-                        except:
-                            pass
-                    log.info(f"  Amazon CSS fiyat: {p}")
+                            if fv and fv < 100: p += fv / 100
+                        except: pass
+                    log.info(f"  Amazon fiyat: {p}")
                     return p, in_stock
-
         p = _try_jsonld(soup)
-        if p:
-            return p, in_stock
-
-        for pattern in [r'"priceAmount"\s*:\s*([\d.]+)', r'"buyingPrice"\s*:\s*([\d.]+)']:
-            m = re.search(pattern, html)
-            if m:
-                p = parse_price(m.group(1))
-                if p and 10 < p < 1_000_000:
-                    return p, in_stock
-
-        log.warning(f"  Amazon fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
+        if p: return p, in_stock
+        log.warning(f"  Amazon fiyat yok | {soup.title.string[:50] if soup.title else 'yok'}")
     except Exception as e:
-        log.warning(f"  Amazon hata [{url[:50]}]: {e}")
+        log.warning(f"  Amazon hata: {e}")
     return None, True
 
 
 def get_price_n11(url: str):
     try:
-        headers = dict(SESSION.headers)
-        headers["Accept-Encoding"] = "gzip, deflate"
-        r = SESSION.get(url, timeout=15, headers=headers)
+        r    = scraper_get(url)
+        html = _decode_response(r)
         log.info(f"  N11 HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
-
-        html = _decode_response(r)
         soup = BeautifulSoup(html, "html.parser")
-
-        el = soup.select_one('[itemprop="price"]')
+        el   = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
             if p and 10 < p < 1_000_000:
                 return p, True
-
         for sel in [".newPrice ins", ".price ins", ".prodPrice", ".fiyat"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
                 if p and 10 < p < 1_000_000:
                     return p, True
-
-        for pattern in [r'"salePrice"\s*:\s*([\d.]+)', r'"displayedPrice"\s*:\s*([\d.]+)']:
-            m = re.search(pattern, html)
-            if m:
-                p = parse_price(m.group(1))
-                if p and 10 < p < 1_000_000:
-                    return p, True
-
-        log.warning(f"  N11 fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
+        log.warning(f"  N11 fiyat yok")
     except Exception as e:
-        log.warning(f"  N11 hata [{url[:50]}]: {e}")
+        log.warning(f"  N11 hata: {e}")
     return None, True
-
 def fetch_price(product: dict):
     url  = product.get("url", "")
     plat = platform_from_url(url) if url else product.get("platform", "").lower()
