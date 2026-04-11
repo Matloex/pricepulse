@@ -277,61 +277,13 @@ def normalize_url(raw: str) -> str:
     url = raw.strip()
     if not url.startswith("http"):
         url = "https://" + url
-
     u = url.lower()
-
-    # Trendyol kısa link
-    if "ty.gl" in u:
+    # Kısa linkler — redirect takip et
+    if "ty.gl" in u or "app.hb.biz" in u or "amzn.to" in u or "a.co/" in u:
         url = _resolve_short_url(url)
-
-    # Hepsiburada kısa link
-    if "app.hb.biz" in u:
-        url = _resolve_short_url(url)
-
-    # Amazon kısa linkler
-    if any(x in u for x in ["amzn.to/", "amzn.eu/d/", "a.co/"]):
+    # Amazon normalizasyonu
+    if platform_from_url(url) == "amazon":
         url = normalize_amazon(url)
-    elif platform_from_url(url) == "amazon":
-        url = normalize_amazon(url)
-
-    return url
-    """
-    Her türlü Amazon linkini amazon.com.tr ürün linkine çevirir.
-    Desteklenen formatlar:
-      - amazon.com.tr/dp/ASIN
-      - amazon.de/dp/ASIN  (EU)
-      - amzn.eu/d/ASIN     (mobil kısa link)
-      - amzn.to/XXXX       (kısa link — önce resolve et)
-      - a.co/XXXX          (kısa link — önce resolve et)
-    """
-    u = url.lower()
-
-    # Kısa linkler — önce gerçek URL'ye çevir
-    if any(x in u for x in ["amzn.to/", "amzn.eu/d/", "a.co/"]):
-        try:
-            r = SESSION.get(url, allow_redirects=True, timeout=10)
-            url = r.url  # redirect sonrası gerçek URL
-            log.info(f"Amazon kısa link çözüldü: {url[:60]}")
-        except Exception as e:
-            log.warning(f"Amazon kısa link çözülemedi: {e}")
-            # amzn.eu/d/ASIN formatından ASIN çekmeyi dene
-            m = re.search(r'/d/([A-Z0-9]{10})', url, re.IGNORECASE)
-            if m:
-                return f"https://www.amazon.com.tr/dp/{m.group(1)}"
-            return url
-
-    # ASIN'i bul ve TR linkine çevir
-    for pat in [
-        r'/dp/([A-Z0-9]{10})',
-        r'/gp/product/([A-Z0-9]{10})',
-        r'/d/([A-Z0-9]{10})',
-        r'asin=([A-Z0-9]{10})',
-    ]:
-        m = re.search(pat, url, re.IGNORECASE)
-        if m:
-            asin = m.group(1).upper()
-            return f"https://www.amazon.com.tr/dp/{asin}"
-
     return url
 
 def is_valid_url(url: str) -> bool:
@@ -584,13 +536,15 @@ def get_price_hepsiburada(url: str):
 def get_price_amazon(url: str):
     try:
         url = normalize_amazon(url)
-        r   = SESSION.get(url, timeout=15)
-        log.info(f"  Amazon HTTP {r.status_code} [{url[:60]}]")
+        headers = dict(SESSION.headers)
+        headers["Accept-Encoding"] = "gzip, deflate"
+        r = SESSION.get(url, timeout=15, headers=headers)
+        log.info(f"  Amazon HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
 
-        html = r.text
-        soup = BeautifulSoup(r.content, "html.parser")
+        html = _decode_response(r)
+        soup = BeautifulSoup(html, "html.parser")
         in_stock = ("Stokta yok" not in html
                     and "currently unavailable" not in html.lower()
                     and "şu anda mevcut değil" not in html.lower())
@@ -629,7 +583,7 @@ def get_price_amazon(url: str):
                 if p and 10 < p < 1_000_000:
                     return p, in_stock
 
-        log.warning(f"  Amazon fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
+        log.warning(f"  Amazon fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
     except Exception as e:
         log.warning(f"  Amazon hata [{url[:50]}]: {e}")
     return None, True
@@ -637,18 +591,20 @@ def get_price_amazon(url: str):
 
 def get_price_n11(url: str):
     try:
-        r    = SESSION.get(url, timeout=15)
-        log.info(f"  N11 HTTP {r.status_code} [{url[:60]}]")
+        headers = dict(SESSION.headers)
+        headers["Accept-Encoding"] = "gzip, deflate"
+        r = SESSION.get(url, timeout=15, headers=headers)
+        log.info(f"  N11 HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
             return None, True
 
-        html = r.text
-        soup = BeautifulSoup(r.content, "html.parser")
+        html = _decode_response(r)
+        soup = BeautifulSoup(html, "html.parser")
 
         el = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
-            if p:
+            if p and 10 < p < 1_000_000:
                 return p, True
 
         for sel in [".newPrice ins", ".price ins", ".prodPrice", ".fiyat"]:
@@ -665,7 +621,7 @@ def get_price_n11(url: str):
                 if p and 10 < p < 1_000_000:
                     return p, True
 
-        log.warning(f"  N11 fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
+        log.warning(f"  N11 fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
     except Exception as e:
         log.warning(f"  N11 hata [{url[:50]}]: {e}")
     return None, True
@@ -1733,13 +1689,23 @@ async def check_link(app, product: dict):
         return
     record_price(product, price)
     log.info(f"  🔗 {product['name'][:40]}: {fmt(price)} (hedef: {fmt(product['target_price'])})")
-    if price > product["target_price"] or not _cooldown_ok(product) or is_silent_now():
+
+    if price > product["target_price"]:
+        log.info(f"  ↳ Hedef aşılmamış ({fmt(price)} > {fmt(product['target_price'])})")
         return
+    if not _cooldown_ok(product):
+        kalan = int(SETTINGS.get("alert_cooldown", ALERT_COOLDOWN) - (time.time() - product["last_alerted"]) / 60)
+        log.info(f"  ↳ Cooldown: {kalan} dk kaldı")
+        return
+    if is_silent_now():
+        log.info(f"  ↳ Sessiz mod aktif")
+        return
+
     text, kb = build_alert_link(product, price, in_stock)
     await app.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=kb, parse_mode="HTML")
     product["last_alerted"] = time.time()
     mark_dirty()
-    log.info(f"  ✅ Alarm: {product['name'][:40]}")
+    log.info(f"  ✅ Alarm gönderildi: {product['name'][:40]}")
 
 async def check_keyword(app, product: dict):
     limit   = SETTINGS.get("max_keyword_results", 5)
