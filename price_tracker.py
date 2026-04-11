@@ -53,7 +53,7 @@ UPSTASH_URL     = os.environ.get("UPSTASH_URL",      "")
 UPSTASH_TOKEN   = os.environ.get("UPSTASH_TOKEN",    "")
 SCRAPER_KEY     = os.environ.get("SCRAPER_API_KEY",  "")  # scraperapi.com
 CHECK_EVERY     = 1
-ALERT_COOLDOWN  = 30
+ALERT_COOLDOWN  = 0
 DAILY_REPORT    = "09:00"
 MAX_PARALLEL    = 5
 
@@ -149,7 +149,7 @@ def save_products(products: list):
 def load_settings() -> dict:
     defaults = {
         "check_every":          CHECK_EVERY,
-        "alert_cooldown":       ALERT_COOLDOWN,
+        "alert_cooldown":       0,
         "daily_report":         DAILY_REPORT,
         "silent_start":         "23:00",
         "silent_end":           "08:00",
@@ -1225,7 +1225,7 @@ async def cmd_ayarlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚙️ <b>Ayarlar</b>\n\n"
         f"check_every         → {s.get('check_every',1)} dk\n"
-        f"alert_cooldown      → {s.get('alert_cooldown',30)} dk\n"
+        f"alert_cooldown      → {s.get('alert_cooldown',0)} dk\n"
         f"daily_report        → {s.get('daily_report','09:00')}\n"
         f"silent_mode         → {s.get('silent_mode',False)}\n"
         f"silent_start        → {s.get('silent_start','23:00')}\n"
@@ -1322,7 +1322,7 @@ async def cmd_liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Buton satırları
         row1 = []
-        if p.get("type", "link") == "link" and p.get("url"):
+        if p.get("url"):
             row1.append(InlineKeyboardButton("🛒 Ürüne Git", url=p["url"]))
         if p.get("type", "link") == "link":
             row1.append(InlineKeyboardButton("💰 Fiyat Sorgula", callback_data=f"fiyatsor_{pid}"))
@@ -1400,21 +1400,23 @@ async def cmd_kontrol(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 diff = price - p["target_price"]
                 if diff <= 0:
                     sonuclar.append(
-                        f"🎯 <b>{label_of(p)}</b>\n"
-                        f"   {fmt(price)} — hedefe ulaştı! ({fmt(abs(diff))} ucuz)"
+                        f"🛒 <b>{label_of(p)}</b>\n"
+                        f"   {fmt(price)} — SATIN AL! ({fmt(abs(diff))} ucuz)"
                     )
                     # Cooldown yoksa alarm gönder
                     if _cooldown_ok(p) and not is_silent_now():
                         text, kb = build_alert_link(p, price, in_stock)
+                        cid = update.effective_chat.id
                         await context.application.bot.send_message(
-                            chat_id=CHAT_ID, text=text, reply_markup=kb, parse_mode="HTML"
+                            chat_id=cid, text=text, reply_markup=kb, parse_mode="HTML"
                         )
                         p["last_alerted"] = time.time()
                         mark_dirty()
                 else:
+                    pct = round(diff/p["target_price"]*100, 1)
                     sonuclar.append(
                         f"📦 <b>{label_of(p)}</b>\n"
-                        f"   {fmt(price)} — hedefe %{round(diff/p['target_price']*100,1)} uzakta"
+                        f"   {fmt(price)} — hedefe %{pct} uzakta"
                     )
             elif t == "keyword":
                 results = await asyncio.get_event_loop().run_in_executor(
@@ -1532,7 +1534,7 @@ async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏪 Satıcı: {sum(1 for p in PRODUCTS if p.get('type')=='seller')}\n"
         f"📈 Ölçüm: {olcum}\n\n"
         f"⏱ Tarama: {SETTINGS.get('check_every',1)} dk\n"
-        f"🔕 Cooldown: {SETTINGS.get('alert_cooldown',30)} dk\n"
+        f"🔕 Cooldown: {SETTINGS.get('alert_cooldown',0)} dk\n"
         f"🌙 Sessiz: {'Açık' if SETTINGS.get('silent_mode') else 'Kapalı'}",
         parse_mode="HTML"
     )
@@ -1575,6 +1577,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data  = q.data
+    log.info(f"Callback: {data}")
     # Güvenli split: action ilk kelime, geri kalan ID
     idx    = data.index("_") if "_" in data else len(data)
     action = data[:idx]
@@ -1607,11 +1610,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "delete":
         p = find_product(rest)
+        log.info(f"Silme isteği: rest={rest}, bulundu={p is not None}")
         if p:
-            lbl = label_of(p); PRODUCTS.remove(p); save_products(PRODUCTS)
-            await q.edit_message_text(f"🗑 <b>{lbl}</b> silindi.", parse_mode="HTML")
+            lbl = label_of(p)
+            PRODUCTS.remove(p)
+            save_products(PRODUCTS)
+            try:
+                await q.edit_message_text(f"🗑 <b>{lbl}</b> silindi.", parse_mode="HTML")
+            except Exception:
+                await q.answer(f"✅ {lbl} silindi.")
         else:
-            await q.edit_message_text("❌ Bulunamadı.")
+            await q.edit_message_text(f"❌ Bulunamadı. (id: {rest[:8]})")
         return
 
     if action == "history":
@@ -1632,14 +1641,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = find_product(rest)
         if not p: await q.edit_message_text("❌ Bulunamadı."); return
         await q.edit_message_text(f"🔍 <b>{p['name']}</b>\nFiyat alınıyor...", parse_mode="HTML")
-        price, in_stock = fetch_price(p)
+        # Async olarak çalıştır — UI'ı bloklamaz
+        price, in_stock = await asyncio.get_event_loop().run_in_executor(None, fetch_price, p)
         if price is None:
-            await q.edit_message_text(f"⚠️ <b>{p['name']}</b>\nFiyat alınamadı.", parse_mode="HTML"); return
+            await q.edit_message_text(f"⚠️ <b>{p['name']}</b>\nFiyat alınamadı. Site geçici erişilemiyor olabilir.", parse_mode="HTML"); return
         record_price(p, price)
         flush_if_dirty()
         diff = price - p["target_price"]
-        ok   = (f"✅ Hedefe ulaştı! {fmt(abs(diff))} ucuz!" if diff<=0
-                else f"📍 Hedefe {fmt(diff)} ({round(diff/p['target_price']*100,1)}%) uzakta")
+        if diff <= 0:
+            ok = f"🎯 Hedef fiyata ulaştı! {fmt(abs(diff))} ucuz — SATIN AL!"
+        else:
+            ok = f"📍 Hedefe {fmt(diff)} ({round(diff/p['target_price']*100,1)}%) uzakta"
         await q.edit_message_text(
             f"💰 <b>{p['name']}</b>\n\n"
             f"Şu an: <b>{fmt(price)}</b>\nHedef: {fmt(p['target_price'])}\n{ok}\n"
@@ -1865,6 +1877,7 @@ def main():
         },
         fallbacks=[CommandHandler("iptal", conv_iptal)],
         allow_reentry=True,
+        per_message=False,
     )
 
     conv_ayarlar = ConversationHandler(
