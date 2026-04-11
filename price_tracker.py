@@ -452,160 +452,114 @@ def _try_jsonld(soup) -> float | None:
     return None
 
 def get_price_trendyol(url: str):
-    """
-    Trendyol fiyat çekici.
-    Önce gizli API'yi dener (JSON), olmazsa HTML'den çeker.
-    """
     try:
-        # URL'den content-id çıkar
-        # Format: trendyol.com/marka/isim-p-123456789 veya ?boutiqueId=xxx&merchantId=yyy
-        content_id = None
-        m = re.search(r'-p-(\d+)', url)
-        if m:
-            content_id = m.group(1)
-
-        if content_id:
-            # Trendyol ürün detay API'si
-            api_url = f"https://public-mdc.trendyol.com/discovery-web-socialgw-service/api/product/detail/{content_id}"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-                "Accept": "application/json",
-                "Origin": "https://www.trendyol.com",
-                "Referer": "https://www.trendyol.com/",
-            }
-            r = SESSION.get(api_url, headers=headers, timeout=12)
-            log.info(f"  Trendyol API HTTP {r.status_code} [id:{content_id}]")
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    # API yanıt yapısını gez
-                    result = data.get("result") or data
-                    price = (
-                        result.get("price", {}).get("discountedPrice", {}).get("value")
-                        or result.get("price", {}).get("originalPrice", {}).get("value")
-                        or result.get("salePrice")
-                        or result.get("price")
-                    )
-                    if price:
-                        p = parse_price(str(price))
-                        if p:
-                            in_stock = result.get("inStock", True)
-                            return p, bool(in_stock)
-                except Exception as e:
-                    log.warning(f"  Trendyol API parse hatası: {e}")
-
-        # API başarısız — HTML fallback
         r = SESSION.get(url, timeout=15)
-        log.info(f"  Trendyol HTML HTTP {r.status_code} [{url[:50]}]")
+        log.info(f"  Trendyol HTTP {r.status_code} [{url[:60]}]")
+        if r.status_code != 200:
+            log.warning(f"  Trendyol {r.status_code}")
+            return None, True
+
+        html = r.text
         soup = BeautifulSoup(r.content, "html.parser")
         in_stock = not bool(soup.select_one(".sold-out-badge, .out-of-stock"))
 
-        # JSON-LD (sunucu tarafı render varsa)
+        # 1. Doğrudan regex ile script içinde fiyat değeri ara — en geniş yaklaşım
+        for pattern in [
+            r'"discountedPrice"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'"sellingPrice"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'"price"\s*:\s*\{[^}]*"value"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'"originalPrice"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'"price"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'\"amount\"\s*:\s*([\d]+(?:\.\d+)?)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                p = parse_price(m.group(1))
+                if p and 10 < p < 1_000_000:
+                    log.info(f"  Trendyol regex fiyat: {p}")
+                    return p, in_stock
+
+        # 2. JSON-LD
         p = _try_jsonld(soup)
         if p:
+            log.info(f"  Trendyol JSON-LD fiyat: {p}")
             return p, in_stock
 
-        # __NEXT_DATA__ veya window.__PRODUCT_DETAIL_APP_INITIAL_STATE__
-        for script in soup.find_all("script"):
-            txt = script.string or ""
-            if "discountedPrice" in txt or "salePrice" in txt:
-                # JSON parse dene
-                for pattern in [
-                    r'"discountedPrice"\s*:\s*([\d.]+)',
-                    r'"salePrice"\s*:\s*([\d.]+)',
-                    r'"price"\s*:\s*([\d.]+)',
-                ]:
-                    m2 = re.search(pattern, txt)
-                    if m2:
-                        p = parse_price(m2.group(1))
-                        if p and 10 < p < 1_000_000:
-                            return p, in_stock
-
-        # CSS selectors
-        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg", "[class*='prc']"]:
+        # 3. CSS selectors
+        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg",
+                    "[class*='prc-dsc']", "[class*='product-price']"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
                 if p and 10 < p < 1_000_000:
+                    log.info(f"  Trendyol CSS fiyat: {p}")
                     return p, in_stock
 
-        log.warning(f"  Trendyol fiyat bulunamadı | {soup.title.string[:40] if soup.title else 'başlık yok'}")
+        # 4. TL veya ₺ işareti yanındaki sayıyı bul
+        matches = re.findall(r'([\d]{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*(?:TL|₺)', html)
+        for raw in matches:
+            p = parse_price(raw)
+            if p and 10 < p < 1_000_000:
+                log.info(f"  Trendyol TL regex fiyat: {p}")
+                return p, in_stock
+
+        log.warning(f"  Trendyol fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
     except Exception as e:
         log.warning(f"  Trendyol hata [{url[:50]}]: {e}")
     return None, True
 
 
 def get_price_hepsiburada(url: str):
-    """
-    Hepsiburada fiyat çekici.
-    SKU id'den API'ye istek atar.
-    """
     try:
-        # SKU çıkar: hepsiburada.com/xxx-pm-SKUID
-        sku = None
-        m = re.search(r'pm-([A-Z0-9]+)', url)
-        if m:
-            sku = m.group(1)
-
-        if sku:
-            # Hepsiburada ürün API'si
-            api_url = f"https://www.hepsiburada.com/api/product/detail/HBV{sku}" if not sku.startswith("HBV") else f"https://www.hepsiburada.com/api/product/detail/{sku}"
-            headers = {
-                "User-Agent": "HepsiburadaAndroid/5.0",
-                "Accept": "application/json",
-                "merchantId": "1",
-            }
-            r = SESSION.get(api_url, headers=headers, timeout=12)
-            log.info(f"  Hepsiburada API HTTP {r.status_code} [sku:{sku}]")
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    price = (
-                        data.get("salePrice")
-                        or data.get("price")
-                        or data.get("originalPrice")
-                    )
-                    if price:
-                        p = parse_price(str(price))
-                        if p:
-                            return p, data.get("available", True)
-                except Exception as e:
-                    log.warning(f"  Hepsiburada API parse: {e}")
-
-        # HTML fallback
         r = SESSION.get(url, timeout=15)
-        log.info(f"  Hepsiburada HTML HTTP {r.status_code} [{url[:50]}]")
+        log.info(f"  Hepsiburada HTTP {r.status_code} [{url[:60]}]")
+        if r.status_code != 200:
+            log.warning(f"  Hepsiburada {r.status_code}")
+            return None, True
+
+        html = r.text
         soup = BeautifulSoup(r.content, "html.parser")
         in_stock = not bool(soup.select_one(".out-of-stock, .tezgah-out-of-stock"))
 
-        # itemprop — en güvenilir HTML yöntemi
+        # 1. itemprop="price" — en güvenilir
         el = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
             if p:
+                log.info(f"  Hepsiburada itemprop fiyat: {p}")
                 return p, in_stock
 
-        # JSON-LD
+        # 2. JSON-LD
         p = _try_jsonld(soup)
         if p:
+            log.info(f"  Hepsiburada JSON-LD fiyat: {p}")
             return p, in_stock
 
-        # Script içinde fiyat ara
-        for script in soup.find_all("script"):
-            txt = script.string or ""
-            if "salePrice" in txt or "currentPrice" in txt:
-                for pattern in [
-                    r'"salePrice"\s*:\s*([\d.]+)',
-                    r'"currentPrice"\s*:\s*([\d.]+)',
-                    r'"price"\s*:\s*([\d.]+)',
-                ]:
-                    m2 = re.search(pattern, txt)
-                    if m2:
-                        p = parse_price(m2.group(1))
-                        if p and 10 < p < 1_000_000:
-                            return p, in_stock
+        # 3. Script içinde regex
+        for pattern in [
+            r'"salePrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
+            r'"currentPrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
+            r'"price"\s*:\s*([\d]+(?:[.,]\d+)?)',
+            r'data-price="([\d]+(?:[.,]\d+)?)"',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                p = parse_price(m.group(1))
+                if p and 10 < p < 1_000_000:
+                    log.info(f"  Hepsiburada regex fiyat: {p}")
+                    return p, in_stock
 
-        log.warning(f"  Hepsiburada fiyat bulunamadı | {soup.title.string[:40] if soup.title else 'başlık yok'}")
+        # 4. CSS selectors
+        for sel in [".price-value", "[class*='currentPrice']",
+                    ".product-price", "[class*='price-value']"]:
+            el = soup.select_one(sel)
+            if el:
+                p = parse_price(el.get_text())
+                if p and 10 < p < 1_000_000:
+                    log.info(f"  Hepsiburada CSS fiyat: {p}")
+                    return p, in_stock
+
+        log.warning(f"  Hepsiburada fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
     except Exception as e:
         log.warning(f"  Hepsiburada hata [{url[:50]}]: {e}")
     return None, True
@@ -615,21 +569,21 @@ def get_price_amazon(url: str):
     try:
         url = normalize_amazon(url)
         r   = SESSION.get(url, timeout=15)
-        log.info(f"  Amazon HTTP {r.status_code} [{url[:50]}]")
+        log.info(f"  Amazon HTTP {r.status_code} [{url[:60]}]")
         if r.status_code != 200:
             return None, True
-        soup = BeautifulSoup(r.content, "html.parser")
-        in_stock = ("Stokta yok" not in r.text
-                    and "currently unavailable" not in r.text.lower()
-                    and "şu anda mevcut değil" not in r.text.lower())
 
-        # Fiyat seçiciler — öncelik sırasına göre
+        html = r.text
+        soup = BeautifulSoup(r.content, "html.parser")
+        in_stock = ("Stokta yok" not in html
+                    and "currently unavailable" not in html.lower()
+                    and "şu anda mevcut değil" not in html.lower())
+
         for sel in [
             "#corePriceDisplay_desktop_feature_div .a-price-whole",
             "#corePriceDisplay_desktop_feature_div .a-offscreen",
             ".a-price.aok-align-center .a-offscreen",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
+            "#priceblock_ourprice", "#priceblock_dealprice",
             "#apex_desktop_newAccordionRow .a-price-whole",
             ".a-price-whole",
         ]:
@@ -645,24 +599,21 @@ def get_price_amazon(url: str):
                                 p += fv / 100
                         except:
                             pass
+                    log.info(f"  Amazon CSS fiyat: {p}")
                     return p, in_stock
 
-        # JSON-LD fallback
         p = _try_jsonld(soup)
         if p:
             return p, in_stock
 
-        # Script içinde fiyat ara
-        for script in soup.find_all("script", type="text/javascript"):
-            txt = script.string or ""
-            if "priceAmount" in txt or "buyingPrice" in txt:
-                m2 = re.search(r'"priceAmount"\s*:\s*([\d.]+)', txt)
-                if m2:
-                    p = parse_price(m2.group(1))
-                    if p and 10 < p < 1_000_000:
-                        return p, in_stock
+        for pattern in [r'"priceAmount"\s*:\s*([\d.]+)', r'"buyingPrice"\s*:\s*([\d.]+)']:
+            m = re.search(pattern, html)
+            if m:
+                p = parse_price(m.group(1))
+                if p and 10 < p < 1_000_000:
+                    return p, in_stock
 
-        log.warning(f"  Amazon fiyat bulunamadı | {soup.title.string[:40] if soup.title else 'başlık yok'}")
+        log.warning(f"  Amazon fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
     except Exception as e:
         log.warning(f"  Amazon hata [{url[:50]}]: {e}")
     return None, True
@@ -671,19 +622,19 @@ def get_price_amazon(url: str):
 def get_price_n11(url: str):
     try:
         r    = SESSION.get(url, timeout=15)
-        log.info(f"  N11 HTTP {r.status_code} [{url[:50]}]")
+        log.info(f"  N11 HTTP {r.status_code} [{url[:60]}]")
         if r.status_code != 200:
             return None, True
+
+        html = r.text
         soup = BeautifulSoup(r.content, "html.parser")
 
-        # itemprop
         el = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
             if p:
                 return p, True
 
-        # CSS
         for sel in [".newPrice ins", ".price ins", ".prodPrice", ".fiyat"]:
             el = soup.select_one(sel)
             if el:
@@ -691,17 +642,14 @@ def get_price_n11(url: str):
                 if p and 10 < p < 1_000_000:
                     return p, True
 
-        # Script içinde fiyat ara
-        for script in soup.find_all("script"):
-            txt = script.string or ""
-            if "salePrice" in txt or "displayedPrice" in txt:
-                m2 = re.search(r'"(?:salePrice|displayedPrice|price)"\s*:\s*([\d.]+)', txt)
-                if m2:
-                    p = parse_price(m2.group(1))
-                    if p and 10 < p < 1_000_000:
-                        return p, True
+        for pattern in [r'"salePrice"\s*:\s*([\d.]+)', r'"displayedPrice"\s*:\s*([\d.]+)']:
+            m = re.search(pattern, html)
+            if m:
+                p = parse_price(m.group(1))
+                if p and 10 < p < 1_000_000:
+                    return p, True
 
-        log.warning(f"  N11 fiyat bulunamadı | {soup.title.string[:40] if soup.title else 'başlık yok'}")
+        log.warning(f"  N11 fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
     except Exception as e:
         log.warning(f"  N11 hata [{url[:50]}]: {e}")
     return None, True
