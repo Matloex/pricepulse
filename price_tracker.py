@@ -263,15 +263,32 @@ def platform_from_url(url: str) -> str:
     ]): return "amazon"
     return "diger"
 
+def normalize_amazon(url: str) -> str:
+    """Her Amazon linkini amazon.com.tr/dp/ASIN formatına çevir."""
+    for pat in [
+        r'/dp/([A-Z0-9]{10})',
+        r'/gp/product/([A-Z0-9]{10})',
+        r'/d/([A-Z0-9]{10})',
+        r'asin=([A-Z0-9]{10})',
+    ]:
+        m = re.search(pat, url, re.IGNORECASE)
+        if m:
+            return f"https://www.amazon.com.tr/dp/{m.group(1).upper()}"
+    return url
+
 def _resolve_short_url(url: str) -> str:
-    """Kısa linki gerçek URL'ye çevir (redirect takip et)."""
+    """Kısa linki redirect takip ederek gerçek URL'ye çevir."""
     try:
-        r = SESSION.get(url, allow_redirects=True, timeout=10)
-        final = r.url
-        log.info(f"Kısa link çözüldü: {url[:40]} → {final[:60]}")
-        return final
+        r = SESSION.get(url, allow_redirects=True, timeout=10,
+                        headers={"Accept-Encoding": "gzip, deflate"})
+        log.info(f"Kısa link: {url[:40]} → {r.url[:60]}")
+        return r.url
     except Exception as e:
         log.warning(f"Kısa link çözülemedi [{url}]: {e}")
+        # amzn.eu/d/ASIN formatından ASIN çekmeyi dene
+        m = re.search(r'/d/([A-Z0-9]{10})', url, re.IGNORECASE)
+        if m:
+            return f"https://www.amazon.com.tr/dp/{m.group(1).upper()}"
         return url
 
 def normalize_url(raw: str) -> str:
@@ -280,9 +297,9 @@ def normalize_url(raw: str) -> str:
         url = "https://" + url
     u = url.lower()
     # Kısa linkler — redirect takip et
-    if "ty.gl" in u or "app.hb.biz" in u or "amzn.to" in u or "a.co/" in u:
+    if any(x in u for x in ["ty.gl", "app.hb.biz", "amzn.to", "amzn.eu", "a.co/"]):
         url = _resolve_short_url(url)
-    # Amazon normalizasyonu
+    # Amazon URL'ini normalize et
     if platform_from_url(url) == "amazon":
         url = normalize_amazon(url)
     return url
@@ -842,20 +859,27 @@ async def link_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_LINK_URL
 
 async def link_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url  = normalize_url(update.message.text.strip())
+    raw  = update.message.text.strip()
+    # normalize_url senkron HTTP yapıyor (kısa link resolve) — executor'da çalıştır
+    url  = await asyncio.get_event_loop().run_in_executor(None, normalize_url, raw)
     plat = platform_from_url(url)
+
     if not is_valid_url(url) or plat == "diger":
         await update.message.reply_text(
-            "❌ Tanınamayan link.\n"
-            "Desteklenen: Trendyol, Amazon (TR/EU), Hepsiburada, N11\n\n/iptal",
+            "❌ Link tanınamadı.\n"
+            "Desteklenen: Trendyol (ty.gl), Amazon (amzn.to/eu, amazon.de/com/com.tr), "
+            "Hepsiburada (app.hb.biz), N11\n\n"
+            f"Gönderdiğin: <code>{raw[:80]}</code>\n\n/iptal",
             parse_mode="HTML"
         )
         return ASK_LINK_URL
+
     context.user_data["url"]  = url
     context.user_data["plat"] = plat
     disp = {"trendyol":"Trendyol","hepsiburada":"Hepsiburada","amazon":"Amazon TR","n11":"N11"}.get(plat, plat)
+    changed = f"\n🔄 Çevrilen: <code>{url[:60]}</code>" if url != raw else ""
     await update.message.reply_text(
-        f"✅ Platform: <b>{disp}</b>\n\nHedef fiyatı yaz:\n<i>örn: 3500</i>\n\n/iptal",
+        f"✅ Platform: <b>{disp}</b>{changed}\n\nHedef fiyatı yaz:\n<i>örn: 3500</i>\n\n/iptal",
         parse_mode="HTML"
     )
     return ASK_LINK_PRICE
@@ -881,9 +905,11 @@ async def link_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         f"✅ <b>Eklendi!</b>\n\n📦 {product['name']}\n🏪 {disp}\n🎯 Hedef: {fmt(price)}\n\n"
-        f"İlk tarama {SETTINGS.get('check_every',1)} dk içinde.",
+        f"Fiyat şimdi kontrol ediliyor...",
         parse_mode="HTML"
     )
+    # Hemen fiyat kontrolü yap — hedef altındaysa anında alarm
+    await check_link(context.application, product)
     return ConversationHandler.END
 
 # ── Keyword ─────────────────────────────────────────────
