@@ -451,21 +451,34 @@ def _try_jsonld(soup) -> float | None:
             continue
     return None
 
+def _decode_response(r) -> str:
+    """Response'u doğru şekilde decode et — brotli/gzip/deflate hepsini handle eder."""
+    import codecs
+    # requests zaten Content-Encoding'i otomatik handle eder (gzip, deflate)
+    # Brotli için brotli kütüphanesi gerekir, yoksa manuel dene
+    try:
+        return r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return r.content.decode("latin-1")
+        except:
+            return r.text
+
 def get_price_trendyol(url: str):
     try:
-        r = SESSION.get(url, timeout=15)
-        log.info(f"  Trendyol HTTP {r.status_code} [{url[:60]}]")
+        # Brotli'yi devre dışı bırak — Accept-Encoding'i sınırla
+        headers = dict(SESSION.headers)
+        headers["Accept-Encoding"] = "gzip, deflate"
+        r = SESSION.get(url, timeout=15, headers=headers)
+        log.info(f"  Trendyol HTTP {r.status_code} encoding={r.encoding} [{url[:55]}]")
         if r.status_code != 200:
-            log.warning(f"  Trendyol {r.status_code}")
             return None, True
 
-        # Encoding düzeltme — gzip/brotli sorununu çöz
-        r.encoding = "utf-8"
-        html = r.text
+        html = _decode_response(r)
         soup = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".sold-out-badge, .out-of-stock"))
 
-        # 1. Script içinde fiyat regex — en geniş yaklaşım
+        # 1. Script içinde fiyat regex
         for pattern in [
             r'"discountedPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"sellingPrice"\s*:\s*([\d]+(?:\.\d+)?)',
@@ -504,10 +517,9 @@ def get_price_trendyol(url: str):
                 log.info(f"  Trendyol TL regex: {p}")
                 return p, in_stock
 
-        title = soup.title.string if soup.title else "başlık yok"
-        log.warning(f"  Trendyol fiyat yok | {title[:60]}")
-        # Debug: HTML snippet
-        log.warning(f"  Trendyol HTML snippet: {html[1000:1200]}")
+        title = soup.title.string if soup.title else "yok"
+        log.warning(f"  Trendyol fiyat yok | başlık: {title[:60]}")
+        log.warning(f"  Trendyol HTML ilk 300: {html[:300]}")
     except Exception as e:
         log.warning(f"  Trendyol hata [{url[:50]}]: {e}")
     return None, True
@@ -515,32 +527,32 @@ def get_price_trendyol(url: str):
 
 def get_price_hepsiburada(url: str):
     try:
-        r = SESSION.get(url, timeout=15)
-        log.info(f"  Hepsiburada HTTP {r.status_code} [{url[:60]}]")
+        headers = dict(SESSION.headers)
+        headers["Accept-Encoding"] = "gzip, deflate"
+        r = SESSION.get(url, timeout=15, headers=headers)
+        log.info(f"  Hepsiburada HTTP {r.status_code} [{url[:55]}]")
         if r.status_code != 200:
-            log.warning(f"  Hepsiburada {r.status_code}")
             return None, True
 
-        r.encoding = "utf-8"
-        html = r.text
+        html = _decode_response(r)
         soup = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".out-of-stock, .tezgah-out-of-stock"))
 
-        # 1. itemprop="price" — en güvenilir
+        # 1. itemprop
         el = soup.select_one('[itemprop="price"]')
         if el:
             p = parse_price(el.get("content") or el.get_text())
-            if p:
+            if p and 10 < p < 1_000_000:
                 log.info(f"  Hepsiburada itemprop fiyat: {p}")
                 return p, in_stock
 
         # 2. JSON-LD
         p = _try_jsonld(soup)
-        if p:
+        if p and 10 < p < 1_000_000:
             log.info(f"  Hepsiburada JSON-LD fiyat: {p}")
             return p, in_stock
 
-        # 3. Script içinde regex
+        # 3. Script regex
         for pattern in [
             r'"salePrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
             r'"currentPrice"\s*:\s*([\d]+(?:[.,]\d+)?)',
@@ -554,9 +566,8 @@ def get_price_hepsiburada(url: str):
                     log.info(f"  Hepsiburada regex fiyat: {p}")
                     return p, in_stock
 
-        # 4. CSS selectors
-        for sel in [".price-value", "[class*='currentPrice']",
-                    ".product-price", "[class*='price-value']"]:
+        # 4. CSS
+        for sel in [".price-value", "[class*='currentPrice']", ".product-price"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
@@ -564,7 +575,7 @@ def get_price_hepsiburada(url: str):
                     log.info(f"  Hepsiburada CSS fiyat: {p}")
                     return p, in_stock
 
-        log.warning(f"  Hepsiburada fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
+        log.warning(f"  Hepsiburada fiyat yok | {soup.title.string[:60] if soup.title else 'yok'}")
     except Exception as e:
         log.warning(f"  Hepsiburada hata [{url[:50]}]: {e}")
     return None, True
@@ -1597,14 +1608,21 @@ async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_text = get_last_log(25)
-    # Telegram 4096 karakter limiti
-    if len(log_text) > 3800:
-        log_text = "...\n" + log_text[-3800:]
-    await update.message.reply_text(
-        f"📋 <b>Son Loglar</b>\n\n<pre>{log_text}</pre>",
-        parse_mode="HTML"
-    )
+    try:
+        with open("pricepulse.log", "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-30:]
+        # Binary / non-printable karakterleri temizle
+        clean = ""
+        for line in lines:
+            clean += "".join(c if c.isprintable() or c in "\n\t" else "?" for c in line)
+        if len(clean) > 3800:
+            clean = "...\n" + clean[-3800:]
+        await update.message.reply_text(
+            f"📋 <b>Son Loglar</b>\n\n<pre>{clean}</pre>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Log okunamadı: {e}")
 
 async def cmd_yardim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
