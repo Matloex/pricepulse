@@ -48,7 +48,7 @@ from telegram.ext import (
 # ════════════════════════════════════════════════════════
 
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN",  "8597080702:AAFY-udbqWDoTmuAJIr52GGmDl5DuSCTFoE")
-CHAT_ID         = int(os.environ.get("1003976351142", "0"))
+CHAT_ID         = int(os.environ.get("CHAT_ID", "1003976351142"))
 UPSTASH_URL     = os.environ.get("UPSTASH_URL",      "")
 UPSTASH_TOKEN   = os.environ.get("UPSTASH_TOKEN",    "")
 CHECK_EVERY     = 1
@@ -252,10 +252,9 @@ def label_of(p: dict) -> str:
 
 def platform_from_url(url: str) -> str:
     u = url.lower()
-    if "trendyol.com"    in u: return "trendyol"
-    if "hepsiburada.com" in u: return "hepsiburada"
-    if "n11.com"         in u: return "n11"
-    # Amazon — tüm domain varyantları
+    if "trendyol.com" in u or "ty.gl" in u:          return "trendyol"
+    if "hepsiburada.com" in u or "app.hb.biz" in u:  return "hepsiburada"
+    if "n11.com"         in u:                         return "n11"
     if any(x in u for x in [
         "amazon.com.tr", "amazon.de", "amazon.com", "amazon.co.uk",
         "amazon.fr", "amazon.it", "amazon.es", "amazon.nl",
@@ -263,7 +262,39 @@ def platform_from_url(url: str) -> str:
     ]): return "amazon"
     return "diger"
 
-def normalize_amazon(url: str) -> str:
+def _resolve_short_url(url: str) -> str:
+    """Kısa linki gerçek URL'ye çevir (redirect takip et)."""
+    try:
+        r = SESSION.get(url, allow_redirects=True, timeout=10)
+        final = r.url
+        log.info(f"Kısa link çözüldü: {url[:40]} → {final[:60]}")
+        return final
+    except Exception as e:
+        log.warning(f"Kısa link çözülemedi [{url}]: {e}")
+        return url
+
+def normalize_url(raw: str) -> str:
+    url = raw.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    u = url.lower()
+
+    # Trendyol kısa link
+    if "ty.gl" in u:
+        url = _resolve_short_url(url)
+
+    # Hepsiburada kısa link
+    if "app.hb.biz" in u:
+        url = _resolve_short_url(url)
+
+    # Amazon kısa linkler
+    if any(x in u for x in ["amzn.to/", "amzn.eu/d/", "a.co/"]):
+        url = normalize_amazon(url)
+    elif platform_from_url(url) == "amazon":
+        url = normalize_amazon(url)
+
+    return url
     """
     Her türlü Amazon linkini amazon.com.tr ürün linkine çevirir.
     Desteklenen formatlar:
@@ -301,14 +332,6 @@ def normalize_amazon(url: str) -> str:
             asin = m.group(1).upper()
             return f"https://www.amazon.com.tr/dp/{asin}"
 
-    return url
-
-def normalize_url(raw: str) -> str:
-    url = raw.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-    if platform_from_url(url) == "amazon":
-        url = normalize_amazon(url)
     return url
 
 def is_valid_url(url: str) -> bool:
