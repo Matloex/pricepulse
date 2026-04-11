@@ -90,85 +90,86 @@ log = logging.getLogger(__name__)
 #  🗄️  VERİ YÖNETİMİ — Upstash Redis
 # ════════════════════════════════════════════════════════
 
-def _redis(cmd: str, *args):
-    """Upstash Redis REST API çağrısı."""
-    if not UPSTASH_URL or not UPSTASH_TOKEN:
-        raise RuntimeError("UPSTASH_URL ve UPSTASH_TOKEN ayarlanmamış!")
-    parts = [cmd] + [str(a) for a in args]
-    r = requests.post(
-        f"{UPSTASH_URL}/pipeline",
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        json=[[p] if i == 0 else p for i, p in enumerate(parts)],
-        timeout=10
-    )
-    # Basit tek komut için direkt endpoint
-    r = requests.post(
-        f"{UPSTASH_URL}/{'/'.join(parts)}",
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        timeout=10
-    )
-    return r.json()
-
 def _redis_get(key: str):
-    """Redis'ten değer oku."""
-    r = requests.get(
-        f"{UPSTASH_URL}/get/{key}",
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        timeout=10
-    )
-    data = r.json()
-    return data.get("result")
+    """Redis'ten string değer oku. Upstash REST API."""
+    try:
+        r = requests.get(
+            f"{UPSTASH_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            timeout=10
+        )
+        data = r.json()
+        # Upstash cevabı: {"result": "değer"} veya {"result": null}
+        result = data.get("result")
+        return result  # str veya None
+    except Exception as e:
+        log.error(f"Redis GET hatası [{key}]: {e}")
+        return None
 
 def _redis_set(key: str, value: str):
-    """Redis'e değer yaz."""
-    requests.post(
-        f"{UPSTASH_URL}/set/{key}",
-        headers={
-            "Authorization": f"Bearer {UPSTASH_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"value": value},
-        timeout=10
-    )
+    """Redis'e string değer yaz. Upstash REST API."""
+    try:
+        # Upstash SET komutu: POST /set/KEY body=VALUE
+        r = requests.post(
+            f"{UPSTASH_URL}/set/{key}",
+            headers={
+                "Authorization": f"Bearer {UPSTASH_TOKEN}",
+                "Content-Type": "text/plain",
+            },
+            data=value.encode("utf-8"),
+            timeout=10
+        )
+        data = r.json()
+        if data.get("result") != "OK":
+            log.error(f"Redis SET başarısız [{key}]: {data}")
+    except Exception as e:
+        log.error(f"Redis SET hatası [{key}]: {e}")
 
 def load_products() -> list:
     try:
         raw = _redis_get(_KEY_PRODUCTS)
         if raw:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            # Güvenlik: gerçekten liste mi?
+            if isinstance(parsed, list):
+                log.info(f"Redis'ten {len(parsed)} ürün yüklendi.")
+                return parsed
+            log.error(f"Redis products beklenen liste değil: {type(parsed)}")
     except Exception as e:
-        log.error(f"Redis ürün yükleme hatası: {e}")
+        log.error(f"Ürün yükleme hatası: {e}")
     return []
 
 def save_products(products: list):
     try:
         _redis_set(_KEY_PRODUCTS, json.dumps(products, ensure_ascii=False))
     except Exception as e:
-        log.error(f"Redis kaydetme hatası: {e}")
+        log.error(f"Ürün kaydetme hatası: {e}")
 
 def load_settings() -> dict:
     defaults = {
-        "check_every": CHECK_EVERY,
-        "alert_cooldown": ALERT_COOLDOWN,
-        "daily_report": DAILY_REPORT,
-        "silent_start": "23:00",
-        "silent_end": "08:00",
-        "silent_mode": False,
-        "max_keyword_results": 5,
+        "check_every":          CHECK_EVERY,
+        "alert_cooldown":       ALERT_COOLDOWN,
+        "daily_report":         DAILY_REPORT,
+        "silent_start":         "23:00",
+        "silent_end":           "08:00",
+        "silent_mode":          False,
+        "max_keyword_results":  5,
     }
     try:
         raw = _redis_get(_KEY_SETTINGS)
         if raw:
-            defaults.update(json.loads(raw))
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                defaults.update(parsed)
     except Exception as e:
-        log.error(f"Redis ayar yükleme hatası: {e}")
+        log.error(f"Ayar yükleme hatası: {e}")
     return defaults
 
 def save_settings(s: dict):
     try:
         _redis_set(_KEY_SETTINGS, json.dumps(s, ensure_ascii=False))
     except Exception as e:
-        log.error(f"Redis ayar kaydetme hatası: {e}")
+        log.error(f"Ayar kaydetme hatası: {e}")
 
 PRODUCTS: list = load_products()
 SETTINGS: dict = load_settings()
