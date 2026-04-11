@@ -459,18 +459,20 @@ def get_price_trendyol(url: str):
             log.warning(f"  Trendyol {r.status_code}")
             return None, True
 
+        # Encoding düzeltme — gzip/brotli sorununu çöz
+        r.encoding = "utf-8"
         html = r.text
-        soup = BeautifulSoup(r.content, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".sold-out-badge, .out-of-stock"))
 
-        # 1. Doğrudan regex ile script içinde fiyat değeri ara — en geniş yaklaşım
+        # 1. Script içinde fiyat regex — en geniş yaklaşım
         for pattern in [
             r'"discountedPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"sellingPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"price"\s*:\s*\{[^}]*"value"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"originalPrice"\s*:\s*([\d]+(?:\.\d+)?)',
             r'"price"\s*:\s*([\d]+(?:\.\d+)?)',
-            r'\"amount\"\s*:\s*([\d]+(?:\.\d+)?)',
+            r'"amount"\s*:\s*([\d]+(?:\.\d+)?)',
         ]:
             m = re.search(pattern, html)
             if m:
@@ -485,9 +487,8 @@ def get_price_trendyol(url: str):
             log.info(f"  Trendyol JSON-LD fiyat: {p}")
             return p, in_stock
 
-        # 3. CSS selectors
-        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg",
-                    "[class*='prc-dsc']", "[class*='product-price']"]:
+        # 3. CSS
+        for sel in [".prc-dsc", ".pr-bx-pr-dsc span", ".prc-slg", "[class*='prc-dsc']"]:
             el = soup.select_one(sel)
             if el:
                 p = parse_price(el.get_text())
@@ -495,15 +496,18 @@ def get_price_trendyol(url: str):
                     log.info(f"  Trendyol CSS fiyat: {p}")
                     return p, in_stock
 
-        # 4. TL veya ₺ işareti yanındaki sayıyı bul
+        # 4. TL/₺ yanındaki sayı
         matches = re.findall(r'([\d]{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*(?:TL|₺)', html)
         for raw in matches:
             p = parse_price(raw)
             if p and 10 < p < 1_000_000:
-                log.info(f"  Trendyol TL regex fiyat: {p}")
+                log.info(f"  Trendyol TL regex: {p}")
                 return p, in_stock
 
-        log.warning(f"  Trendyol fiyat yok | {soup.title.string[:60] if soup.title else 'başlık yok'}")
+        title = soup.title.string if soup.title else "başlık yok"
+        log.warning(f"  Trendyol fiyat yok | {title[:60]}")
+        # Debug: HTML snippet
+        log.warning(f"  Trendyol HTML snippet: {html[1000:1200]}")
     except Exception as e:
         log.warning(f"  Trendyol hata [{url[:50]}]: {e}")
     return None, True
@@ -517,8 +521,9 @@ def get_price_hepsiburada(url: str):
             log.warning(f"  Hepsiburada {r.status_code}")
             return None, True
 
+        r.encoding = "utf-8"
         html = r.text
-        soup = BeautifulSoup(r.content, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         in_stock = not bool(soup.select_one(".out-of-stock, .tezgah-out-of-stock"))
 
         # 1. itemprop="price" — en güvenilir
